@@ -1,109 +1,78 @@
 import os
-import asyncio
 import logging
-from google import genai
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+import asyncio
 from aiohttp import web
+import google.generativeai as genai
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Настройка логирования в консоль Render
+# 1. Настройка логирования (чтобы видеть всё в Render)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- 1. HEALTH CHECK СЕРВЕР ---
-async def handle_hc(request):
-    return web.Response(text="Бот живой!")
+# 2. Настройка API ключей из переменных окружения
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-async def start_web_server():
+# Инициализация Gemini
+genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+# 3. Функция обработки сообщений
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    logger.info(f"📩 НОВОЕ СООБЩЕНИЕ от {update.effective_user.first_name}: {user_text}")
+
+    try:
+        # Отправляем запрос в Gemini
+        response = model.generate_content(user_text)
+        await update.message.reply_text(response.text)
+        logger.info(f"✅ ОТВЕТ ОТПРАВЛЕН пользователю {update.effective_user.id}")
+    except Exception as e:
+        logger.error(f"❌ ОШИБКА GEMINI: {e}")
+        await update.message.reply_text("Извини, нейросеть сейчас недоступна. Попробуй позже.")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Я бот на базе Gemini 1.5 Flash. Напиши мне что-нибудь!")
+
+# 4. Веб-сервер для "здоровья" Render (Health Check)
+async def handle_health_check(request):
+    return web.Response(text="Бот работает!", status=200)
+
+async def run_bot():
+    # Создаем приложение Telegram
+    application = Application.builder().token(TOKEN).build()
+
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Настройка веб-сервера для Render
     app = web.Application()
-    app.router.add_get('/', handle_hc)
+    app.router.add_get("/", handle_health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
     await site.start()
-    logger.info(f"✅ Веб-сервер запущен на порту {port}")
 
-# --- 2. ДАННЫЕ И КОНТЕКСТ ---
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-API_KEY = os.environ.get('GEMINI_API_KEY')
+    # Запуск бота
+    async with application:
+        # Сброс вебхуков и старых обновлений, чтобы избежать Conflict
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        await application.initialize()
+        await application.start()
+        logger.info("🚀 БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ")
+        await application.updater.start_polling()
 
-def get_context_safe():
+        # Держим бота запущенным
+        while True:
+            await asyncio.sleep(3600)
+
+if __name__ == "__main__":
     try:
-        if os.path.exists('optimized_history.txt'):
-            with open('optimized_history.txt', 'r', encoding='utf-8') as f:
-                # Берем только последние 15к символов для гарантии работы на Free Tier
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - 15000))
-                return f.read()
-    except Exception as e:
-        logger.error(f"Ошибка чтения истории: {e}")
-    return "Стиль: общайся как человек."
-
-# --- 3. ОБРАБОТКА СООБЩЕНИЙ ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Если это не текстовое сообщение — игнорируем
-    if not update.message or not update.message.text:
-        return
-
-    user_text = update.message.text
-    logger.info(f"📩 НОВОЕ СООБЩЕНИЕ: {user_text}")
-
-    try:
-        client = genai.Client(api_key=API_KEY)
-        history_snippet = get_context_safe()
-
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            config={
-                'system_instruction': f"Ты мой цифровой клон. Твой стиль:\n{history_snippet}"
-            },
-            contents=user_text
-        )
-
-        if response and response.text:
-            logger.info(f"🤖 ОТВЕТ GEMINI: {response.text[:50]}...")
-            await update.message.reply_text(response.text)
-        else:
-            logger.warning("⚠️ Gemini вернул пустой результат")
-
-    except Exception as e:
-        logger.error(f"❌ ОШИБКА ОБРАБОТКИ: {e}")
-
-# --- 4. ГЛАВНЫЙ ЗАПУСК ---
-async def main():
-    # Сначала запускаем сервер, чтобы Render не убил деплой
-    await start_web_server()
-
-    if not TOKEN or not API_KEY:
-        logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Токены не заданы в Environment Variables!")
-        return
-
-    # Инициализация приложения
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    await app.initialize()
-
-    # КЛЮЧЕВОЙ МОМЕНТ: Удаляем старые вебхуки и чистим очередь
-    logger.info("♻️ Сброс старых соединений Telegram...")
-    await app.bot.delete_webhook(drop_pending_updates=True)
-
-    await app.start()
-    await app.updater.start_polling()
-
-    logger.info("🚀 БОТ ПОЛНОСТЬЮ ЗАПУЩЕН И СЛУШАЕТ TELEGRAM")
-
-    # Держим процесс активным
-    while True:
-        await asyncio.sleep(3600)
-
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
+        asyncio.run(run_bot())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен вручную.")
+        logger.info("Бот остановлен")
