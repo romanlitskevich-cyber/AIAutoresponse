@@ -29,7 +29,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Пробуем стандартную модель 1.5 Flash
         # В новом SDK 2026 года пишем просто название без префиксов
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents=user_text
         )
 
