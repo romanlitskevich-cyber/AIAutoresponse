@@ -19,7 +19,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
 # Инициализация Gemini
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('models/gemini-1.5-flash')
 
 # 3. Функция обработки сообщений
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
