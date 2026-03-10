@@ -1,9 +1,7 @@
 FROM python:3.11-slim
-RUN useradd -m -u 1000 user
-USER user
-ENV PATH="/home/user/.local/bin:${PATH}"
 WORKDIR /app
-COPY --chown=user requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY --chown=user . .
+COPY . .
+# Мы НЕ копируем secrets.txt в образ, Render сам подложит его при запуске
 CMD ["python", "bot.py"]
