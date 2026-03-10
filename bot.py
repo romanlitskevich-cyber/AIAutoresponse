@@ -1,13 +1,21 @@
 import os
 import asyncio
+import logging
 from google import genai
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from aiohttp import web
 
-# --- 1. HEALTH CHECK ДЛЯ RENDER ---
+# Настройка логирования в консоль Render
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- 1. HEALTH CHECK СЕРВЕР ---
 async def handle_hc(request):
-    return web.Response(text="Alive")
+    return web.Response(text="Бот живой!")
 
 async def start_web_server():
     app = web.Application()
@@ -17,74 +25,85 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"✅ Web Port {port} opened")
+    logger.info(f"✅ Веб-сервер запущен на порту {port}")
 
-# --- 2. НАСТРОЙКИ ---
+# --- 2. ДАННЫЕ И КОНТЕКСТ ---
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 API_KEY = os.environ.get('GEMINI_API_KEY')
 
-def load_context():
+def get_context_safe():
     try:
         if os.path.exists('optimized_history.txt'):
             with open('optimized_history.txt', 'r', encoding='utf-8') as f:
-                # Берем только последние 20 000 символов для стабильности
-                f.seek(0, 2)
+                # Берем только последние 15к символов для гарантии работы на Free Tier
+                f.seek(0, os.SEEK_END)
                 size = f.tell()
-                f.seek(max(0, size - 20000))
+                f.seek(max(0, size - 15000))
                 return f.read()
     except Exception as e:
-        print(f"Ошибка чтения файла: {e}")
-    return "Стиль: кратко."
+        logger.error(f"Ошибка чтения истории: {e}")
+    return "Стиль: общайся как человек."
 
-# --- 3. ОБРАБОТКА ---
+# --- 3. ОБРАБОТКА СООБЩЕНИЙ ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Если это не текстовое сообщение — игнорируем
     if not update.message or not update.message.text:
         return
 
     user_text = update.message.text
-    print(f"📩 Получено сообщение: {user_text}") # Увидишь это в логах Render
+    logger.info(f"📩 НОВОЕ СООБЩЕНИЕ: {user_text}")
 
     try:
         client = genai.Client(api_key=API_KEY)
-        my_context = load_context()
+        history_snippet = get_context_safe()
 
-        # Используем полный путь к модели, чтобы избежать 404
         response = client.models.generate_content(
             model="gemini-1.5-flash",
             config={
-                'system_instruction': f"Ты мой цифровой клон. База твоей личности:\n{my_context}"
+                'system_instruction': f"Ты мой цифровой клон. Твой стиль:\n{history_snippet}"
             },
             contents=user_text
         )
 
         if response and response.text:
-            print(f"🤖 Ответ Gemini: {response.text[:50]}...")
+            logger.info(f"🤖 ОТВЕТ GEMINI: {response.text[:50]}...")
             await update.message.reply_text(response.text)
         else:
-            print("⚠️ Gemini прислал пустой ответ")
+            logger.warning("⚠️ Gemini вернул пустой результат")
 
     except Exception as e:
-        print(f"❌ Ошибка при обработке: {e}")
+        logger.error(f"❌ ОШИБКА ОБРАБОТКИ: {e}")
 
-# --- 4. ЗАПУСК ---
+# --- 4. ГЛАВНЫЙ ЗАПУСК ---
 async def main():
+    # Сначала запускаем сервер, чтобы Render не убил деплой
     await start_web_server()
 
     if not TOKEN or not API_KEY:
-        print("❌ Ключи не найдены в Environment Variables!")
+        logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Токены не заданы в Environment Variables!")
         return
 
+    # Инициализация приложения
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await app.initialize()
-    await app.start()
-    # Чистим очередь, чтобы бот не завис на старых сообщениях
-    await app.updater.start_polling(drop_pending_updates=True)
 
-    print("🚀 БОТ ЗАПУЩЕН И ЖДЕТ СООБЩЕНИЙ")
+    # КЛЮЧЕВОЙ МОМЕНТ: Удаляем старые вебхуки и чистим очередь
+    logger.info("♻️ Сброс старых соединений Telegram...")
+    await app.bot.delete_webhook(drop_pending_updates=True)
+
+    await app.start()
+    await app.updater.start_polling()
+
+    logger.info("🚀 БОТ ПОЛНОСТЬЮ ЗАПУЩЕН И СЛУШАЕТ TELEGRAM")
+
+    # Держим процесс активным
     while True:
         await asyncio.sleep(3600)
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен вручную.")
