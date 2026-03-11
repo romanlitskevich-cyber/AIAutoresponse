@@ -3,104 +3,108 @@ import logging
 import asyncio
 from aiohttp import web
 from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+# --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
+# --- КОНФИГУРАЦИЯ ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+HISTORY_FILE = "optimized_history.txt"  # Твой оптимизированный файл
 
-# Инициализация клиента
 client = genai.Client(api_key=GEMINI_KEY)
 
-# СПИСОК МОДЕЛЕЙ ДЛЯ ПЕРЕБОРА (составлен на основе твоего списка доступных)
-# Бот будет пробовать их строго по порядку сверху вниз
-MODELS_TO_TRY = [
-    "gemini-2.5-flash",       # Самая новая и сбалансированная
-    "gemini-2.0-flash-lite",  # Самая легкая (обычно самые большие лимиты)
-    "gemini-2.0-flash-001",   # Предыдущее стабильное поколение
-    "gemini-2.5-pro",         # Мощная модель (на крайний случай)
-    "gemma-3-27b-it"          # Открытая модель Google (если всё остальное лежит)
-]
+# --- ЗАГРУЗКА БАЗЫ ЗНАНИЙ ---
+def load_personality():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                content = f.read()
+                logger.info(f"✅ База стиля загружена: {len(content)} символов")
+                return content
+        except Exception as e:
+            logger.error(f"❌ Ошибка чтения файла: {e}")
+    return "Примеры переписки отсутствуют. Отвечай вежливо и кратко."
 
-# --- ЛОГИКА ОБРАБОТКИ СООБЩЕНИЙ ---
+MY_STYLE = load_personality()
+
+# Системная инструкция, которая делает из нейронки тебя
+SYSTEM_INSTRUCTION = f"""
+Ты — цифровая копия владельца этого аккаунта. Твоя цель — отвечать на входящие сообщения в Telegram точно так же, как это сделал бы он.
+
+ПРАВИЛА:
+1. Изучи 'БАЗУ СТИЛЯ' ниже. Обрати внимание на: длину фраз, использование сленга, наличие или отсутствие заглавных букв, любимые эмодзи и манеру здороваться/прощаться.
+2. Отвечай максимально похоже. Если владелец пишет кратко — отвечай кратко.
+3. НИКОГДА не упоминай, что ты ИИ, бот или Gemini. Ты — это он.
+4. Если вопрос слишком личный или сложный, ответь в своем стиле: "я ща занят, позже гляну" или что-то подобное.
+
+БАЗА СТИЛЯ (ПРИМЕРЫ ТВОИХ ОТВЕТОВ):
+---
+{MY_STYLE}
+---
+"""
+
+# --- ОБРАБОТКА СООБЩЕНИЙ ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    logger.info(f"📩 НОВОЕ СООБЩЕНИЕ: {user_text}")
+    logger.info(f"📩 Входящее от {update.effective_user.first_name}: {user_text}")
 
-    response_text = None
+    # Список моделей: 2.5 Flash в приоритете
+    models = ["gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"]
 
-    # Запускаем цикл перебора моделей
-    for model_name in MODELS_TO_TRY:
+    for model_name in models:
         try:
-            logger.info(f"🔄 Пробуем отправить запрос в {model_name}...")
-
             response = client.models.generate_content(
                 model=model_name,
-                contents=user_text
+                contents=user_text,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.8, # Чуть выше для естественности
+                    top_p=0.95,
+                )
             )
 
-            # Если ответ получен успешно, сохраняем его и ПРЕРЫВАЕМ цикл
             if response.text:
-                response_text = response.text
-                logger.info(f"✅ УСПЕХ! Ответила модель: {model_name}")
-                break
-
+                await update.message.reply_text(response.text)
+                logger.info(f"✅ Успешный ответ от {model_name}")
+                return
         except Exception as e:
-            error_msg = str(e)
-            if "429" in error_msg or "Quota" in error_msg:
-                logger.warning(f"⚠️ Лимиты (429) для {model_name}. Иду к следующей...")
-                continue # Переходим к следующей модели в списке
-            else:
-                logger.error(f"❌ Ошибка {model_name}: {error_msg}. Иду к следующей...")
-                continue # При других ошибках тоже пробуем следующую
+            logger.warning(f"⚠️ Модель {model_name} выдала ошибку: {e}")
+            continue
 
-    # Проверяем, удалось ли хоть одной модели дать ответ
-    if response_text:
-        await update.message.reply_text(response_text)
-    else:
-        # Если цикл закончился, а ответа нет (все модели выдали ошибку)
-        await update.message.reply_text(
-            "Извини, сейчас все серверы нейросети перегружены или исчерпан лимит бесплатного тарифа (Ошибка 429). "
-            "Пожалуйста, подожди немного или обнови API-ключ."
-        )
+    await update.message.reply_text("Я сейчас не на связи, отвечу как освобожусь!")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот с умным переключением моделей. Напиши мне что-нибудь!")
+    await update.message.reply_text("Автоответчик в твоем стиле запущен и готов к работе.")
 
-# --- СЕРВЕР ДЛЯ RENDER (Health Check) ---
+# --- СЕРВЕР ДЛЯ RENDER ---
 async def handle_health_check(request):
-    return web.Response(text="Бот онлайн и готов перебирать модели!", status=200)
+    return web.Response(text="Bot is alive", status=200)
 
 async def run_bot():
-    # Настройка Telegram
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Настройка Web-сервера для Render
     app = web.Application()
     app.router.add_get("/", handle_health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", 10000).start()
 
-    # Запуск Telegram-бота с защитой от Conflict (409)
     async with application:
-        logger.info("🧹 Очистка старых сессий (защита от Conflict)...")
+        # Защита от Conflict (409)
         await application.bot.delete_webhook(drop_pending_updates=True)
         await application.initialize()
         await application.start()
-
-        logger.info("🚀 СИСТЕМА ЗАПУЩЕНА")
-        # Еще раз чистим очередь перед самым началом опроса
+        logger.info("🚀 СИСТЕМА ПОЛНОСТЬЮ ЗАПУЩЕНА")
         await application.updater.start_polling(drop_pending_updates=True)
 
         while True:
@@ -110,4 +114,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(run_bot())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен вручную.")
+        logger.info("Бот остановлен.")
